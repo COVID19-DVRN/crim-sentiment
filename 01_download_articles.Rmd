@@ -1,0 +1,131 @@
+---
+title: "Download article text"
+output: html_document
+---
+
+This code downloads and cleans articles from MediaCloud searches. Only unique URLs that have not been scraped previously are attempted. The MediaCloud data and article text for each unique article that has ever been searched for are saved in `articles_scored.csv`, which will be updated every time the code is run.
+
+```{css, echo = FALSE}
+.python {
+  background-color: #e7e7e7
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, error = TRUE, eval = TRUE)
+reticulate::use_python("/usr/local/bin/python3")
+```
+
+Load R packages.
+```{r}
+library(reticulate)
+library(dplyr)
+library(vroom)
+```
+
+Load python packages.
+```{python}
+import pandas as pd
+import nltk
+from newspaper import Article
+# nltk.download('punkt')
+sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
+
+```
+
+The `incarceration` directory contains the files downloaded directly from MediaCloud. These files all end with `_orig.csv`. All searches will be combined and the results saved in a single file, but they can be split up again based on these original search files. To avoid duplication, only unique URLs  -- unique both among new and previous searches -- are scraped.
+
+```{r}
+# the files straight from mediacloud were downloaded with _orig endings on the file names
+orig_files <- list.files("data", "orig.csv$", full.names = TRUE)
+
+# the urls that have been downloaded already
+already <- vroom("data/articles_scored.csv")
+already_url <- pull(already, url) %>% unique()
+
+remove_downloaded <- function(file, already_id) {
+  vroom(file) %>%
+    filter(!url %in% already_url)
+}
+
+# combine all the new articles that need downloading
+new_articles <- purrr:::map_dfr(orig_files, remove_downloaded, already_url)
+
+# new variables
+search_articles <- new_articles %>%
+  select(url) %>%
+  filter(!duplicated(url)) %>%
+  mutate(text = NA_character_, clean_text = NA_character_, not_available = NA_integer_,
+         neg = NA_real_, neu = NA_real_, pos = NA_real_, compound = NA_real_)
+```
+
+In order to remove non-article text, there are two sets of phrases (based on manually searching the most common phrases that appear over multiple articles): `to_remove` are phrases that are associated with "bad" text, while `to_keep` are phrases that should be kept no matter what, even if a "bad" phrase also appears. After scraping the article text, the article is split up by sentences and sentences are removed based on these sets of phrases.
+```{python}
+search_articles = r.search_articles
+search_articles_size = search_articles.shape[0]
+
+to_remove = ['newsletter', 'sign up', 'signing up', 'subscri', 'inbox', 'our readers', 'reprint', 'articles', 'ajc', 'journalism', 'latest stories', 'homepage', 'javascript', 'copyright', 'follow us', 'privacy policy', 'email address', 'confirmation email', 'spam folder', 'news live', 'continuing coverage', 'are you a ', 'vtdigger', 'see offers.', 'latest headlines', 'android', 'tune in', 'publication', 'scroll ', 'editor ', 'contributed to this report', 'breitbart news', 'read more here', 'customized to your preferences', 'up to the minute news', 'consider making a one time or monthly donation', 'news and weather', '©', 'click here', 'latest posts', 'latest news', 'developing story', 'homepage', 'weather alerts', 'dear readers', 'credit card required', 'read more', 'articles for free', 'your contributions', 'rights reserved', 'reprinted without permission', 'original article', 'related articles', 'readers informed', 'service to our community', 'rewritten', 'log in', 'more stories on coronavirus here', 'responsible for all content', 'science coverage', 'established in 2002, we operate', 'relevant reporting', 'filed under', 'coverage on coronavirus', 'rewritten', 'keep reading', 'article is available', 'daily caller news', 'winds light', 'thunderstorm', 'associated press writers', 'we want to hear from you', 'what has changed about your daily life', 'what kinds of discussions are you having', 'wisconsinreport', 'wiscreport', 'is reporting each day', 'every little bit helps', 'a cute picture of a dog', 'comments comments', 'tips?', 'read the full story', 'prism is a nonprofit affiliate of daily kos', 'follow @','follow him on twitter', 'follow her on twitter', 'connect with noozhawk on facebook', 'follow noozhawk on twitter', 'is a reporter for', 'to see more, visit', 'contact us at editors@time.com.', 'with proper attribution', 'share them with lv', 'find out more at', 'latest information on coronavirus go to', 'originally published on', 'licensing opportunities', 'latest breaking news', 'write to josiah bates', 'provided this article', 'news organization that is funded in part by donations', 'news service is a collaboration', 'the editors']
+
+to_keep = ['inmate', 'plea bargain', 'prison', 'jail', 'detain', 'incarc', 'request for comment', 'crimin']
+
+for i in range(search_articles_size):
+
+    # Load article    
+    url = search_articles.loc[i,"url"] 
+    article = Article(url.strip())
+    
+    # Extract the text
+    try:
+        article.download()
+        article.parse()
+        text = article.text
+
+        # clean a bit
+        text = text.replace('\n\n', ' ')
+        search_articles.loc[i, "not_available"] = 0
+        search_articles.loc[i,"text"] = text
+        
+        # split into sentences to remove non-article text
+        text = text.replace('“','"').replace('”','"').replace('—','.') # some articles end with this, unfortunately
+        sentences = nltk.tokenize.sent_tokenize(text)
+        keep_sentences = []
+        for j in range(len(sentences)):
+            new_sentence = sentences[j].lower()
+            new_sentence = new_sentence.replace("advertisement", " ")
+            if any(good in new_sentence for good in to_keep):
+                keep_sentences.append(sentences[j])
+                continue
+            elif any(bad in new_sentence for bad in to_remove):
+                continue
+            else:
+                keep_sentences.append(sentences[j])
+        to_return = ' '.join(keep_sentences)
+        
+        search_articles.loc[i, "clean_text"] = to_return
+
+        
+    # Otherwise, indicate as not available
+    except:
+        search_articles.loc[i,"not_available"] = 1
+        continue 
+        
+
+```
+
+The results are unique by URL. They are merged back into the original search file, and then appended to the former search results. The former search results are saved to `articles_scored_old.csv` and the new, combined results to `articles_scored.csv`. They can be split again by search by joining with the original MedialCloud files, ending in `_orig.csv`.
+```{r}
+sentences_scored <- py$search_articles
+
+# merge back with full data
+new_articles <- new_articles %>% 
+  left_join(sentences_scored, by = "url") %>%
+  select(stories_id:compound)
+
+# save previous version in case of mistakes -- don't want to overwrite
+readr::write_csv(already, file.path(mediacloud_dir, "data/articles_scored_old.csv"))
+
+# combine new with old and save over old version
+bind_rows(already, new_articles) %>%
+  distinct() %>%
+  readr::write_csv(file.path(mediacloud_dir, "data/articles_scored.csv"))
+```
